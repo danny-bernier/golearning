@@ -1,0 +1,3 @@
+dev:
+  - containerName: "learning go app"
+  - logLevel: debug
