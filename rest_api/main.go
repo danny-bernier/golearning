@@ -30,17 +30,17 @@ func main() {
 	App.log.Info("Application initialized!")
 
 	serviceWikisteps := wikiSteps.InitWikistepsService(App.log)
-	results, err := serviceWikisteps.FindSteps(start, finish, 5)
+	results, err := serviceWikisteps.FindSteps(start, finish, 3)
 	if err != nil {
 		App.log.Error(err.Error())
 	}
 
 	if results == nil {
-		fmt.Print("Didnt get results")
+		App.log.Info("Didnt get results")
 	} else {
-		fmt.Printf("\nFound %d Valid Paths:\n", len(results))
+		App.log.Info(fmt.Sprintf("\nFound %d Valid Paths:\n", len(results)))
 		for _, path := range results {
-			fmt.Printf("Steps: %d, Path: [%s]\n", len(path)-1, strings.Join(path, ", "))
+			App.log.Info(fmt.Sprintf("Steps: %d, Path: [%s]\n", len(path)-1, strings.Join(path, ", ")))
 		}
 	}
 }

@@ -11,7 +11,7 @@ type ZerologAdapter struct {
 }
 
 func NewZerologAdapter() *ZerologAdapter {
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	return &ZerologAdapter{
 		logger: zerolog.New(os.Stdout).With().Timestamp().Logger(),
 	}

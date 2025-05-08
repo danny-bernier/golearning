@@ -9,3 +9,12 @@ func SafeClose[T any](ch chan T) {
 		close(ch)
 	}
 }
+
+func IsChannelClosed(ch chan struct{}) bool {
+	select {
+	case _, ok := <-ch:
+		return !ok
+	default:
+		return false
+	}
+}
