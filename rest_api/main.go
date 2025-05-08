@@ -3,13 +3,14 @@ package main
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"app/rest_api/logging"
 	wikiSteps "app/rest_api/wiki_steps"
 )
 
-var start = "https://en.wikipedia.org/wiki/Stevia"
-var finish = "https://en.wikipedia.org/wiki/Acne"
+var start = "https://en.wikipedia.org/wiki/Friedrich_Merz"
+var finish = "https://en.wikipedia.org/wiki/Machine_translation"
 
 var (
 	App Application
@@ -29,8 +30,12 @@ func main() {
 	initApplication()
 	App.log.Info("Application initialized!")
 
-	serviceWikisteps := wikiSteps.InitWikistepsService(App.log)
-	results, err := serviceWikisteps.FindSteps(start, finish, 3)
+	maxSteps := 7
+	numWorkers := 25
+	stepTimeout := 30 * time.Second
+
+	serviceWikisteps := wikiSteps.NewWikistepsService(App.log, maxSteps, stepTimeout, numWorkers)
+	results, err := serviceWikisteps.FindValidPaths(start, finish, 5)
 	if err != nil {
 		App.log.Error(err.Error())
 	}
@@ -38,9 +43,9 @@ func main() {
 	if results == nil {
 		App.log.Info("Didnt get results")
 	} else {
-		App.log.Info(fmt.Sprintf("\nFound %d Valid Paths:\n", len(results)))
+		App.log.Info(fmt.Sprintf("Found %d Valid Paths:", len(results)))
 		for _, path := range results {
-			App.log.Info(fmt.Sprintf("Steps: %d, Path: [%s]\n", len(path)-1, strings.Join(path, ", ")))
+			App.log.Info(fmt.Sprintf("Steps: %d, Path: [%s]", len(path)-1, strings.Join(path, ", ")))
 		}
 	}
 }

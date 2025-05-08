@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"reflect"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"math"
 
 	"slices"
 
@@ -43,6 +43,18 @@ type wikiStepJob struct {
 	CompletedCh       chan<- wikiStepJob
 }
 
+type wikiStepToolbelt struct {
+	Target      string
+	Timeout     <-chan time.Time
+	JobCh       chan wikiStepJob
+	CompletedCh chan wikiStepJob
+	ExitCh      chan struct{}
+	ErrCh       chan error
+	IdleCh      chan struct{}
+	Wg          *sync.WaitGroup
+	WgCh        chan struct{}
+}
+
 func NewWikistepsService(log logging.Logger, maxSteps int, stepsTimeout time.Duration, numWorkers int) *WikiSteps {
 	return &WikiSteps{
 		log,
@@ -63,11 +75,12 @@ func (w WikiSteps) FindValidPaths(start string, target string, steps int) ([][]s
 	}
 
 	w.log.Trace("Initializing resources...")
-	results := make([][]string, 0) // to aggregate valid results
 	exitCh := make(chan struct{})
 	errCh := make(chan error)
-	jobCh := make(chan wikiStepJob, 100*w.numWorkers)
-	completedCh := make(chan wikiStepJob, 100*w.numWorkers)
+	jobCh := make(chan wikiStepJob, int(math.Pow(10.0, float64(steps))))
+	completedCh := make(chan wikiStepJob, 1000*w.numWorkers)
+	idleCh := make(chan struct{}, w.numWorkers)
+	wgCh := make(chan struct{})
 
 	w.log.Trace("Initializing starting job...")
 	var startingJob wikiStepJob
@@ -81,91 +94,127 @@ func (w WikiSteps) FindValidPaths(start string, target string, steps int) ([][]s
 	w.log.Trace("Initializing wait group...")
 	var wg sync.WaitGroup
 	wg.Add(w.numWorkers)
-
-	w.log.Trace("Starting workers...")
-	for i := 0; i < w.numWorkers; i += 1 {
-		workerName := util.RandomName()
-		go w.wikiStepWorker(util.RandomName(), jobCh, exitCh, errCh, &wg)
-		w.log.Debug(fmt.Sprintf("Started worker %s", workerName))
-	}
+	go func() {
+		wg.Wait()
+		close(wgCh)
+	}()
 
 	timeout := time.After(w.stepsTimeout)
+
+	w.log.Trace("Initializing toolbelt...")
+	toolbelt := wikiStepToolbelt{
+		Target:      target,
+		Timeout:     timeout,
+		JobCh:       jobCh,
+		CompletedCh: completedCh,
+		ExitCh:      exitCh,
+		ErrCh:       errCh,
+		IdleCh:      idleCh,
+		Wg:          &wg,
+		WgCh:        wgCh,
+	}
+
+	w.log.Trace("Starting workers...")
+	workerNames := util.RandomNames(w.numWorkers/100, w.numWorkers)
+	for i := 0; i < w.numWorkers; i += 1 {
+		go w.wikiStepWorker(workerNames[i], toolbelt)
+		w.log.Debug(fmt.Sprintf("Started worker %s", workerNames[i]))
+	}
+
+	results, err := w.wikiStepSupervisor(toolbelt)
+	if err != nil {
+		return results, fmt.Errorf("error in wikiStepSupervisor; %w", err)
+	}
+
+	return append(results, w.wikiStepCleanup(toolbelt)...), nil
+}
+
+func (w WikiSteps) wikiStepCleanup(toolbelt wikiStepToolbelt) [][]string {
+	results := make([][]string, 0)
 	for {
 		select {
-		case <-timeout:
-			w.log.Info(fmt.Sprintf("WikiSteps timed out after %.0f seconds, signaling exit...", w.stepsTimeout.Seconds()))
-			close(exitCh)
-			break
-
-		case err := <-errCh:
-			w.log.Error(fmt.Sprintf("WikiSteps is signaling exit after encountering an error %w", err))
-			close(exitCh)
-			break
-
-		case completedJob := <-completedCh:
+		case completedJob := <-toolbelt.CompletedCh:
 			for _, url := range completedJob.LastPathUrls {
-				if url == target {
-					w.log.Debug(fmt.Sprintf("WikiSteps found a valid path to the target"))
+				if url == toolbelt.Target {
+					w.log.Debug("WikiSteps found a valid path to the target in cleanup")
 					results = append(results, append(completedJob.Path, url))
-
-				} else if completedJob.NumStepsRemaining-1 > 0 {
-					w.log.Trace(fmt.Sprintf("WikiSteps did not find a valid path to target yet, resubmitting job"))
-					var j wikiStepJob
-					j.Path = append(completedJob.Path, url)
-					j.NumStepsRemaining = completedJob.NumStepsRemaining - 1
-					j.CompletedCh = completedCh
-
-				} else {
-					w.log.Trace("WikiSteps dead end! A path ran out of steps")
 				}
 			}
-
-		}
-	}
-	// push jobs onto the job channel using a supervisor
-	//  - recieves on the completed job channels
-	//  - update the step count
-	//  - check if target has been found
-	//  - once timeout triggered, calls exitCh and returns results
-	// workers pull jobs off the channel
-	//	- use the callback to return the updated job
-	//  - workers keep chugging until the exitCh is used
-
-	w.log.Info(fmt.Sprintf("Started stepping! start: %s, target: %s, steps: %d, workers: %d, timeout: %d", start, target, steps, w.numWorkers, w.stepsTimeout))
-	go w.step(path, target, steps, exitCh, resCh)
-
-	// monitoring for results
-	for {
-		select {
-		case r, ok := <-resCh:
-			results = append(results, r)
-			if !ok {
-				util.SafeClose(exitCh)
-				return results, nil
-			}
-		case <-timeout:
-			util.SafeClose(exitCh)
-			return results, fmt.Errorf("execution timed out")
+		case <-toolbelt.WgCh:
+			return results
 		}
 	}
 }
 
-func (w WikiSteps) wikiStepWorker(name string, jobCh <-chan wikiStepJob, exitCh <-chan struct{}, errCh chan<- error, wg *sync.WaitGroup) {
-	defer wg.Done()
+func (w WikiSteps) wikiStepSupervisor(toolbelt wikiStepToolbelt) ([][]string, error) {
+	results := make([][]string, 0)
 	for {
 		select {
-		case <-exitCh:
-			w.log.Debug(fmt.Sprintf("Worker %s received exit signal, closing..."))
+		case <-toolbelt.Timeout:
+			w.log.Info(fmt.Sprintf("WikiSteps timed out after %.0f seconds, signaling exit...", w.stepsTimeout.Seconds()))
+			close(toolbelt.ExitCh)
+			return results, nil
+
+		case err := <-toolbelt.ErrCh:
+			w.log.Info("WikiSteps is signaling exit after encountering an error...")
+			close(toolbelt.ExitCh)
+			return results, err
+
+		case <-time.After(3 * time.Second):
+			if len(toolbelt.IdleCh) >= w.numWorkers && len(toolbelt.JobCh) == 0 {
+				w.log.Debug("WikiSteps workers are all idle and job queue is empty, signaling exit...")
+				close(toolbelt.ExitCh)
+				return results, nil
+			}
+
+		case completedJob := <-toolbelt.CompletedCh:
+			for _, url := range completedJob.LastPathUrls {
+				if url == toolbelt.Target {
+					w.log.Debug("WikiSteps found a valid path to the target")
+					results = append(results, append(completedJob.Path, url))
+
+				} else if completedJob.NumStepsRemaining-1 > 0 {
+					w.log.Debug("WikiSteps did not find a valid path to target yet, resubmitting job")
+					var j wikiStepJob
+					j.Path = append(completedJob.Path, url)
+					j.NumStepsRemaining = completedJob.NumStepsRemaining - 1
+					j.CompletedCh = toolbelt.CompletedCh
+					toolbelt.JobCh <- j
+
+				} else {
+					w.log.Debug("WikiSteps dead end! A path ran out of steps")
+				}
+			}
+		}
+	}
+}
+
+func (w WikiSteps) wikiStepWorker(name string, toolbelt wikiStepToolbelt) {
+	defer toolbelt.Wg.Done()
+	for {
+		select {
+		case <-toolbelt.ExitCh:
+			w.log.Debug(fmt.Sprintf("Worker %s received exit signal, closing...", name))
 			return
-		case job := <-jobCh:
-			wg.Add(1)
-			w.log.Debug(fmt.Sprintf("Worker %s started a new job"))
-			job, err := w.doWikiStepJob(name, job, exitCh)
+		case job := <-toolbelt.JobCh:
+			select {
+			case <-toolbelt.IdleCh:
+				w.log.Trace(fmt.Sprintf("Worker %s is now active, removed from IdleCh", name))
+			default: // If IdleCh is already empty, no action needed
+			}
+			w.log.Debug(fmt.Sprintf("Worker %s started a new job", name))
+			job, err := w.doWikiStepJob(name, job, toolbelt.ExitCh)
 			if err != nil {
-				errCh <- err
+				toolbelt.ErrCh <- err
 				continue
 			}
-			w.log.Debug(fmt.Sprintf("Worker %s completed a job"))
+			toolbelt.CompletedCh <- job
+			w.log.Debug(fmt.Sprintf("Worker %s completed a job", name))
+			select {
+			case toolbelt.IdleCh <- struct{}{}:
+				w.log.Trace(fmt.Sprintf("Worker %s is now idle, added to IdleCh", name))
+			default: // If IdleCh is full, no action needed
+			}
 		}
 	}
 }
@@ -177,39 +226,20 @@ func (w WikiSteps) doWikiStepJob(workerName string, job wikiStepJob, exitCh <-ch
 
 	nextUrl := job.Path[len(job.Path)-1] // isolate the next URL to fetch data for
 
-	// requesting data from Wikipedia
-	w.log.Debug(fmt.Sprintf("Worker %s is waiting for semaphore aquisition...", workerName))
-	select {
-	case httpSem <- struct{}{}:
-		w.log.Debug(fmt.Sprintf("Worker %s aquired semaphore.", workerName))
-		defer func() { <-wikiReqSemaphore }()
-	case <-exitCh:
-		w.log.Debug(fmt.Sprintf("Worker %s recieved exit signal while waiting for semaphore aquisition.", workerName))
+	resp, err := w.callWikipedia(workerName, nextUrl, exitCh)
+	if err != nil {
+		return job, fmt.Errorf("worker %s encountered an error when calling Wikipedia; %w", workerName, err)
+	}
+
+	if resp == nil {
 		return job, nil
-	}
-
-	w.log.Trace(fmt.Sprintf("Worker %s is building GET request for URL %s", workerName, nextUrl))
-	req, err := http.NewRequest("GET", nextUrl, nil)
-	if err != nil {
-		return job, fmt.Errorf("worker %s encountered an error when building GET request for URL: %s; %w", workerName, nextUrl, err)
-	}
-
-	w.log.Debug(fmt.Sprintf("Worker %s is executing a GET request for URL %s", workerName, nextUrl))
-	resp, err := w.httpClient.Do(req)
-	if err != nil {
-		return job, fmt.Errorf("worker %s encountered an error when executing GET for URL %s; %w", workerName, nextUrl, err)
-	}
-
-	if resp.Body == nil {
-		return job, fmt.Errorf("worker %s's response body is nil for URL %s", workerName, nextUrl)
 	} else {
-		defer resp.Body.Close()
+		defer resp.Close()
 	}
-	w.log.Trace(fmt.Sprintf("Worker %s's GET request for URL %s returned a body of size %d bytes", workerName, nextUrl, resp.ContentLength))
 
 	// parsing the resposne body and extracting any valid URLs
 	w.log.Debug(fmt.Sprintf("Worker %s is extracting URLs from the response body of URL %s...", workerName, nextUrl))
-	urls, err := w.extractWikiLinks(req.Body, workerName)
+	urls, err := w.extractWikiLinks(resp, workerName)
 	if err != nil {
 		return job, fmt.Errorf("worker %s encountered an error when extracting URLs from the response body for URL %s; %w", workerName, nextUrl, err)
 	}
@@ -229,11 +259,42 @@ func (w WikiSteps) doWikiStepJob(workerName string, job wikiStepJob, exitCh <-ch
 			urls = slices.Delete(urls, i, i+1)
 		}
 	}
-	w.log.Debug(fmt.Sprintf("Worker %s found %d unique URLs in response body", workerName))
+	w.log.Debug(fmt.Sprintf("Worker %s found %d unique URLs in response body", workerName, len(urls)))
 
 	// updating and returning completed job
 	job.LastPathUrls = urls
 	return job, nil
+}
+
+func (w WikiSteps) callWikipedia(workerName string, url string, exitCh <-chan struct{}) (io.ReadCloser, error) {
+	// requesting data from Wikipedia
+	w.log.Debug(fmt.Sprintf("Worker %s is waiting for semaphore aquisition...", workerName))
+	select {
+	case httpSem <- struct{}{}:
+		w.log.Debug(fmt.Sprintf("Worker %s aquired semaphore.", workerName))
+		defer func() { <-httpSem }()
+	case <-exitCh:
+		w.log.Debug(fmt.Sprintf("Worker %s recieved exit signal while waiting for semaphore aquisition.", workerName))
+		return nil, nil
+	}
+
+	w.log.Trace(fmt.Sprintf("Worker %s is building GET request for URL %s", workerName, url))
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("worker %s encountered an error when building GET request for URL: %s; %w", workerName, url, err)
+	}
+
+	w.log.Debug(fmt.Sprintf("Worker %s is executing a GET request for URL %s", workerName, url))
+	resp, err := w.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("worker %s encountered an error when executing GET for URL %s; %w", workerName, url, err)
+	}
+
+	if resp.Body == nil {
+		return nil, fmt.Errorf("worker %s's response body is nil for URL %s", workerName, url)
+	}
+	w.log.Trace(fmt.Sprintf("Worker %s's GET request for URL %s returned a body of size %d bytes", workerName, url, resp.ContentLength))
+	return resp.Body, nil
 }
 
 func (w WikiSteps) extractWikiLinks(body io.ReadCloser, workerName string) ([]string, error) {
@@ -281,183 +342,6 @@ func (w WikiSteps) extractWikiLinks(body io.ReadCloser, workerName string) ([]st
 		i += 1
 	}
 	return urls, nil
-}
-
-func (w WikiSteps) step(path []string, target string, step int, stopCh chan struct{}, resCh chan<- []string) {
-	// slices of URLs that are potential paths, i want to get back a slice of a completed path, or close the channel if the step max was reached
-	if len(path) == 0 {
-		panic(fmt.Sprintf("Provided path slice is empty or nil. Path: %s", path))
-	}
-
-	nextUrl := path[len(path)-1]
-
-	// if that url is our target publish that completed path
-	if nextUrl == target {
-		w.log.Debug(fmt.Sprintf("Found valid path: [%s]", strings.Join(path, ", ")))
-		resCh <- path
-		close(linkCh)
-		return
-	}
-
-	if step <= 0 {
-		close(linkCh)
-		return
-	}
-
-	links, err := w.fetchWikiLinks(nextUrl, linkCh)
-	if util.IsChannelClosed(linkCh) {
-		return
-	}
-
-	if err != nil {
-		// TODO return the error using a channel
-		w.log.Error(fmt.Sprintf("error when fetching wiki links for url %s; %e", nextUrl, err))
-		close(linkCh)
-		return
-	}
-
-	w.log.Debug(fmt.Sprintf("Found %d links for URL: %s", len(links), nextUrl))
-
-	// initialize a slice of channels
-	linkChs := make([]chan struct{}, len(links))
-	for i := range linkChs {
-		linkChs[i] = make(chan struct{})
-	}
-
-	// start a go routine to check each subsequent link
-	for i, l := range links {
-		nextPath := make([]string, len(path))
-		copy(nextPath, path)
-		nextPath = append(path, l)
-		go w.step(nextPath, target, step-1, linkChs[i], resCh)
-	}
-
-	// using reflect, select until all channels are closed (this means they ran out of steps)
-	var cases []reflect.SelectCase
-	for _, ch := range linkChs {
-		cases = append(cases, reflect.SelectCase{
-			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(ch),
-		})
-	}
-	// adding the linkCh channel parameter
-	cases = append(cases, reflect.SelectCase{
-		Dir:  reflect.SelectRecv,
-		Chan: reflect.ValueOf(linkCh),
-	})
-
-	// loop until every channel is closed
-	for len(cases) > 1 {
-		chosen, _, ok := reflect.Select(cases)
-		if !ok {
-			// if linkCh parameter channel is chosen, close all channels and return
-			if chosen == len(cases)-1 {
-				for _, ch := range linkChs {
-					util.SafeClose(ch)
-				}
-				return
-			} else {
-				// channel is closed, remove it
-				cases = slices.Delete(cases, chosen, chosen+1)
-				w.log.Trace(fmt.Sprintf("Channel is closed and will be removed. Cases slice size is now: %d", len(cases)))
-			}
-		}
-	}
-
-	close(linkCh)
-}
-
-var wikiReqSemaphore = make(chan struct{}, 10)
-
-func (w WikiSteps) fetchWikiLinks(url string, linkCh chan struct{}) ([]string, error) {
-	waiting := true
-	for waiting {
-		select {
-		case wikiReqSemaphore <- struct{}{}:
-			waiting = false
-		case _, ok := <-linkCh:
-			if !ok {
-				return nil, fmt.Errorf("exit was triggered by link channel")
-			}
-		}
-	}
-	defer func() { <-wikiReqSemaphore }()
-
-	w.log.Trace(fmt.Sprintf("Checking validity of URL: %s", url))
-	if !isValidWikiStepUrl(url) {
-		w.log.Debug(fmt.Sprintf("URL is invalid, nothing to fetch. URL: %s", url))
-		return []string{}, nil
-	}
-
-	w.log.Trace(fmt.Sprintf("Creating request for URL: %s", url))
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("error when building http GET request; %w", err)
-	}
-
-	w.log.Info(fmt.Sprintf("Doing http GET request on client for URL: %s", url))
-	resp, err := w.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("error when doing http request on client; %w", err)
-	}
-
-	if resp.Body == nil {
-		return nil, fmt.Errorf("response body is nil for URL: %s", url)
-	} else {
-		defer resp.Body.Close()
-	}
-
-	w.log.Trace("Parsing response body...")
-	node, err := html.Parse(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("error when parsing html response body; %w", err)
-	}
-
-	w.log.Trace("Extracting wiki links from html...")
-	return w.parseWikiLinks(node), nil
-}
-
-func (w WikiSteps) parseWikiLinks(root *html.Node) []string {
-	urlSet := make(map[string]struct{})
-
-	// creating function to traverse nodes
-	var traverse func(n *html.Node)
-	traverse = func(n *html.Node) {
-		if n == nil {
-			return
-		}
-
-		// checking if node is element <a> and has a Wiki URI
-		if n.Type == html.ElementNode && n.Data == "a" {
-			for _, a := range n.Attr {
-				if a.Key == "href" && isValidWikistepUri(a.Val) {
-					url := WikipediaDomain + a.Val
-					if _, exists := urlSet[url]; exists {
-						w.log.Trace(fmt.Sprintf("Node %p has valid duplicate URI: '%s'. URL: '%s'. Unique URL set length: %d", n, a.Val, url, len(urlSet)))
-					} else {
-						urlSet[url] = struct{}{}
-						w.log.Trace(fmt.Sprintf("Node %p has valid new URI: '%s'. URL: '%s'. Unique URL set length: %d", n, a.Val, url, len(urlSet)))
-					}
-				}
-			}
-		}
-
-		// recursive call to traverse children
-		for c := range n.ChildNodes() {
-			traverse(c)
-		}
-	}
-
-	traverse(root)
-
-	// gathering all URLs
-	uniqueUrls := make([]string, len(urlSet))
-	i := 0
-	for k, _ := range urlSet {
-		uniqueUrls[i] = k
-		i += 1
-	}
-	return uniqueUrls
 }
 
 func isValidWikiStepUrl(urls ...string) bool {
